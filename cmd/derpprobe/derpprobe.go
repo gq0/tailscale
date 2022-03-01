@@ -19,7 +19,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +52,7 @@ var (
 	lastDERPMap   *tailcfg.DERPMap
 	lastDERPMapAt time.Time
 	certs         = map[string]*x509.Certificate{}
+	reportedBad   bool
 )
 
 func main() {
@@ -135,13 +138,71 @@ func getOverallStatus() (o overallStatus) {
 	return
 }
 
+func notifySlack(text string) error {
+	type SlackRequestBody struct {
+		Text string `json:"text"`
+	}
+
+	slackBody, err := json.Marshal(SlackRequestBody{Text: text})
+	if err != nil {
+		return err
+	}
+
+	webhookUrl := os.Getenv("SLACK_WEBHOOK")
+	if webhookUrl == "" {
+		return errors.New("No SLACK_WEBHOOK configured")
+	}
+
+	req, err := http.NewRequest(http.MethodPost, webhookUrl, bytes.NewBuffer(slackBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	// if Slack is down, don't break the DERP monitoring. Timeout quickly.
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(resp.Body)
+	if buf.String() != "ok" {
+		return errors.New("Non-ok response returned from Slack")
+	}
+	return nil
+}
+
 func serve(w http.ResponseWriter, r *http.Request) {
 	st := getOverallStatus()
 	summary := "All good"
-	if len(st.bad) > 0 {
+	if (float64(len(st.bad)) / float64(len(st.bad)+len(st.good))) > 0.25 {
+		// This will generate an alert and page a human.
+		// It also ends up in Slack, as part of the alert pipeline.
 		w.WriteHeader(500)
 		summary = fmt.Sprintf("%d problems", len(st.bad))
+	} else if len(st.bad) > 0 {
+		summary = fmt.Sprintf("%d problems", len(st.bad))
+		err := notifySlack(strings.Join(st.bad, "\n"))
+		if err != nil {
+			summary = fmt.Sprintf("%d problems; Notify Slack failed!", len(st.bad))
+		} else {
+			mu.Lock()
+			reportedBad = true
+			mu.Unlock()
+		}
 	}
+
+	mu.Lock()
+	if len(st.bad) == 0 && reportedBad {
+		err := notifySlack("All DERPs recovered.")
+		if err == nil {
+			reportedBad = false
+		}
+	}
+	mu.Unlock()
+
 	io.WriteString(w, "<html><head><style>.bad { font-weight: bold; color: #700; }</style></head>\n")
 	fmt.Fprintf(w, "<body><h1>derp probe</h1>\n%s:<ul>", summary)
 	for _, s := range st.bad {
