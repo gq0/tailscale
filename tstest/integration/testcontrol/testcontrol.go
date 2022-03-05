@@ -197,6 +197,10 @@ func (s *Server) initMux() {
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/", s.serveUnhandled)
 	s.mux.HandleFunc("/key", s.serveKey)
+	// TODO(bradfitz/maisem): add noise support here.
+	s.mux.HandleFunc("/server-key", func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "noise not enabled", http.StatusNotFound)
+	})
 	s.mux.HandleFunc("/machine/", s.serveMachine)
 }
 
